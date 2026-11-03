@@ -12,6 +12,7 @@
     dual-review -Base develop       # against another base branch
     dual-review -Path src/Payments  # full review of a folder instead of a diff
     dual-review -WithCopilot        # add Copilot as a third reviewer
+    dual-review -OpenCodeModels openrouter/z-ai/glm-5.3,openrouter/deepseek/deepseek-v4.1-flash-1017
 #>
 [CmdletBinding()]
 param(
@@ -22,17 +23,34 @@ param(
     [string]$CopilotModel = 'auto',
     [string]$ClaudeModel,
     [string]$CodexModel,
+    # Extra reviewers through the opencode CLI: 'provider/model' or 'provider/model#variant'.
+    [string[]]$OpenCodeModels = @(),
+    # Skip the claude reviewer (e.g. no Anthropic quota available).
+    [switch]$NoClaude,
+    # Write the comparison with this opencode model instead of Claude ('provider/model').
+    [string]$SummaryModel,
     [int]$TimeoutMinutes = 20,
     [switch]$NoSummary
 )
 
 $ErrorActionPreference = 'Stop'
 $utf8 = [Text.UTF8Encoding]::new($false)
+# When launched through dual-review.cmd, pwsh -File binds a comma-separated list as a single
+# string; split it back into model IDs.
+if ($OpenCodeModels) {
+    $OpenCodeModels = @($OpenCodeModels | ForEach-Object { $_ -split ',' } | ForEach-Object Trim | Where-Object { $_ })
+}
 
-function Resolve-Exe([string]$Name, [string[]]$Preferred = @()) {
+function Resolve-Exe([string]$Name, [string[]]$Preferred = @(), [switch]$Optional) {
     foreach ($p in $Preferred) { if (Test-Path -LiteralPath $p) { return $p } }
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $cmd) { throw "'$Name' was not found on PATH." }
+    if (-not $cmd) {
+        if ($Optional) {
+            Write-Host "Skipping $Name reviews: '$Name' was not found on PATH." -ForegroundColor Yellow
+            return $null
+        }
+        throw "'$Name' was not found on PATH."
+    }
     return $cmd.Source
 }
 
@@ -109,37 +127,89 @@ try {
     $gitReadTools = 'git diff', 'git log', 'git show', 'git status'
     $reviewers = [Collections.Generic.List[hashtable]]::new()
 
-    $claudeArgs = @('-p', $instruction, '--no-session-persistence')
-    if ($ClaudeModel) { $claudeArgs += '--model', $ClaudeModel }
-    $claudeArgs += @('--allowedTools', 'Read', 'Grep', 'Glob') + ($gitReadTools | ForEach-Object { "Bash(${_}:*)" })
-    $claudeArgs += '--disallowedTools', 'Edit', 'Write', 'NotebookEdit'
-    $reviewers.Add(@{ Name = 'claude'; Exe = (Resolve-Exe claude); Args = $claudeArgs; Out = 'claude.md' })
+    $claudeExe = if ($NoClaude) { $null } else { Resolve-Exe claude }
+    if ($claudeExe) {
+        $claudeArgs = @('-p', $instruction, '--no-session-persistence')
+        if ($ClaudeModel) { $claudeArgs += '--model', $ClaudeModel }
+        $claudeArgs += @('--allowedTools', 'Read', 'Grep', 'Glob') + ($gitReadTools | ForEach-Object { "Bash(${_}:*)" })
+        $claudeArgs += '--disallowedTools', 'Edit', 'Write', 'NotebookEdit'
+        $reviewers.Add(@{ Name = 'claude'; Exe = $claudeExe; Args = $claudeArgs; Out = 'claude.md' })
+    }
 
     $codexOut = Join-Path $runDir 'codex.md'
-    $codexArgs = @('exec', '--sandbox', 'read-only', '--color', 'never', '--ephemeral', '-o', $codexOut)
-    if ($CodexModel) { $codexArgs += '--model', $CodexModel }
-    $codexArgs += $instruction
-    $codexExe = Resolve-Exe codex @("$env:LOCALAPPDATA\Microsoft\WinGet\Links\codex.exe")
-    # Codex writes its final answer with -o; stdout is progress noise and goes to the log.
-    $reviewers.Add(@{ Name = 'codex'; Exe = $codexExe; Args = $codexArgs; Out = $null; File = 'codex.md' })
+    $codexExe = Resolve-Exe codex @("$env:LOCALAPPDATA\Microsoft\WinGet\Links\codex.exe") -Optional
+    if ($codexExe) {
+        $codexArgs = @('exec', '--sandbox', 'read-only', '--color', 'never', '--ephemeral', '-o', $codexOut)
+        if ($CodexModel) { $codexArgs += '--model', $CodexModel }
+        $codexArgs += $instruction
+        # Codex writes its final answer with -o; stdout is progress noise and goes to the log.
+        $reviewers.Add(@{ Name = 'codex'; Exe = $codexExe; Args = $codexArgs; Out = $null; File = 'codex.md' })
+    }
 
     if ($WithCopilot) {
         $copilotArgs = @('-p', $instruction, '-s', '--no-ask-user', '--no-color', '--model', $CopilotModel)
         $copilotArgs += @('--allow-tool') + ($gitReadTools | ForEach-Object { "shell(${_}:*)" })
         $copilotArgs += '--deny-tool', 'write'
-        $copilotExe = Resolve-Exe copilot @("$env:LOCALAPPDATA\GitHubCopilotCLI\copilot.exe")
-        $reviewers.Add(@{ Name = "copilot ($CopilotModel)"; Exe = $copilotExe; Args = $copilotArgs; Out = 'copilot.md' })
+        $copilotExe = Resolve-Exe copilot @("$env:LOCALAPPDATA\GitHubCopilotCLI\copilot.exe") -Optional
+        if ($copilotExe) {
+            $reviewers.Add(@{ Name = "copilot ($CopilotModel)"; Exe = $copilotExe; Args = $copilotArgs; Out = 'copilot.md' })
+        }
     }
 
+    if ($OpenCodeModels) {
+        # opencode reviewers: deny everything, then re-enable reads and the same read-only git
+        # commands. The config is injected with OPENCODE_CONFIG_CONTENT so nothing is written to
+        # the repository or the user's opencode configuration.
+        $ocPermissions = @(
+            @{ action = '*'; resource = '*'; effect = 'deny' },
+            @{ action = 'read'; resource = '*'; effect = 'allow' },
+            @{ action = 'glob'; resource = '*'; effect = 'allow' },
+            @{ action = 'grep'; resource = '*'; effect = 'allow' }
+        ) + ($gitReadTools | ForEach-Object { @{ action = 'shell'; resource = "$_ *"; effect = 'allow' } })
+        $ocConfig = @{ permissions = $ocPermissions } | ConvertTo-Json -Depth 5 -Compress
+        $ocExe = Resolve-Exe opencode
+        if ($ocExe) {
+            $usedNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($model in $OpenCodeModels) {
+                $short = ($model -split '/')[-1] -replace '#', '-' -replace '[^\w.-]', '-'
+                if (-not $short) { $short = 'model' }
+                $base = $short; $n = 1
+                while (-not $usedNames.Add($short)) { $n++; $short = "$base-$n" }
+                # --standalone: a private server that picks up OPENCODE_CONFIG_CONTENT.
+                # --format json: one JSON event per line; runOne keeps the last text part.
+                $ocArgs = @('run', '--standalone', '--format', 'json', '-m', $model, '--title', 'dual-review', $instruction)
+                $reviewers.Add(@{
+                    Name = "opencode-$short"; Exe = $ocExe; Args = $ocArgs; Out = "opencode-$short.md"
+                    Env = @{ OPENCODE_CONFIG_CONTENT = $ocConfig }; Json = $true
+                })
+            }
+        }
+    }
+
+    if ($reviewers.Count -eq 0) { throw 'No reviewers available: none of the required CLIs were found on PATH.' }
+
     $runOne = {
-        param($Exe, $ArgList, $OutFile, $LogFile, $Cwd)
+        param($Exe, $ArgList, $OutFile, $LogFile, $Cwd, $EnvVars, $Json)
         Set-Location -LiteralPath $Cwd
+        foreach ($kv in @($EnvVars)) { if ($kv) { Set-Item "Env:$($kv.Key)" $kv.Value } }
         [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
         $OutputEncoding = [Text.UTF8Encoding]::new($false)
         $sw = [Diagnostics.Stopwatch]::StartNew()
         if ($OutFile) {
-            $text = $null | & $Exe @ArgList 2> $LogFile | Out-String
-            [IO.File]::WriteAllText($OutFile, $text.Trim() + "`n", [Text.UTF8Encoding]::new($false))
+            if ($Json) {
+                # opencode --format json prints one JSON event per line; keep the last text part.
+                $final = $null
+                foreach ($line in @($null | & $Exe @ArgList 2> $LogFile)) {
+                    $evt = $null
+                    try { $evt = $line | ConvertFrom-Json -ErrorAction SilentlyContinue } catch { continue }
+                    if ($evt.type -eq 'text' -and $evt.part.text) { $final = $evt.part.text }
+                }
+                [IO.File]::WriteAllText($OutFile, ($final ?? '') + "`n", [Text.UTF8Encoding]::new($false))
+            }
+            else {
+                $text = $null | & $Exe @ArgList 2> $LogFile | Out-String
+                [IO.File]::WriteAllText($OutFile, $text.Trim() + "`n", [Text.UTF8Encoding]::new($false))
+            }
         }
         else {
             $null | & $Exe @ArgList *> $LogFile
@@ -153,7 +223,7 @@ try {
         $key = ($r.Name -split ' ')[0]
         $r.File ??= $r.Out
         $outFile = if ($r.Out) { Join-Path $runDir $r.Out } else { $null }
-        $r.Job = Start-Job -ScriptBlock $runOne -ArgumentList $r.Exe, $r.Args, $outFile, (Join-Path $runDir "$key.log"), $repoRoot
+        $r.Job = Start-Job -ScriptBlock $runOne -ArgumentList $r.Exe, $r.Args, $outFile, (Join-Path $runDir "$key.log"), $repoRoot, $r.Env, [bool]$r.Json
     }
 
     Wait-Job -Job ($reviewers | ForEach-Object Job) -Timeout ($TimeoutMinutes * 60) | Out-Null
@@ -194,11 +264,37 @@ try {
     $summaryPrompt = $summaryTemplate -replace '\{\{REVIEWS\}\}', $reviewList -replace '\{\{RUN_DIR\}\}', $runRel
     Write-Utf8 (Join-Path $runDir 'summary-prompt.md') $summaryPrompt
 
-    Write-Host "Comparing reviews with Claude..."
-    $summaryArgs = @('-p', "Read the file $runRel/summary-prompt.md and follow its instructions exactly. Print only the comparison.",
-        '--no-session-persistence', '--allowedTools', 'Read', 'Grep', 'Glob', '--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'Bash')
-    if ($ClaudeModel) { $summaryArgs += '--model', $ClaudeModel }
-    $job = Start-Job -ScriptBlock $runOne -ArgumentList (Resolve-Exe claude), $summaryArgs, (Join-Path $runDir 'summary.md'), (Join-Path $runDir 'summary.log'), $repoRoot
+    if ($SummaryModel) {
+        Write-Host "Comparing reviews with $SummaryModel (opencode)..."
+        $summaryExe = Resolve-Exe opencode
+        if (-not $summaryExe) {
+            Write-Host "The comparison needs the opencode CLI, which was not found. The individual reviews are still in $runDir" -ForegroundColor Yellow
+            return
+        }
+        # Same lockdown as the reviewers, minus the git commands: comparing only needs reads.
+        $sumPermissions = @(
+            @{ action = '*'; resource = '*'; effect = 'deny' },
+            @{ action = 'read'; resource = '*'; effect = 'allow' },
+            @{ action = 'glob'; resource = '*'; effect = 'allow' },
+            @{ action = 'grep'; resource = '*'; effect = 'allow' }
+        )
+        $sumEnv = @{ OPENCODE_CONFIG_CONTENT = (@{ permissions = $sumPermissions } | ConvertTo-Json -Depth 5 -Compress) }
+        $summaryArgs = @('run', '--standalone', '--format', 'json', '-m', $SummaryModel, '--title', 'dual-review summary',
+            "Read the file $runRel/summary-prompt.md and follow its instructions exactly. Print only the comparison.")
+        $job = Start-Job -ScriptBlock $runOne -ArgumentList $summaryExe, $summaryArgs, (Join-Path $runDir 'summary.md'), (Join-Path $runDir 'summary.log'), $repoRoot, $sumEnv, $true
+    }
+    else {
+        Write-Host "Comparing reviews with Claude..."
+        $summaryExe = Resolve-Exe claude -Optional
+        if (-not $summaryExe) {
+            Write-Host "The comparison needs the claude CLI. The individual reviews are still in $runDir (or pass -SummaryModel to compare with an opencode model)." -ForegroundColor Yellow
+            return
+        }
+        $summaryArgs = @('-p', "Read the file $runRel/summary-prompt.md and follow its instructions exactly. Print only the comparison.",
+            '--no-session-persistence', '--allowedTools', 'Read', 'Grep', 'Glob', '--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'Bash')
+        if ($ClaudeModel) { $summaryArgs += '--model', $ClaudeModel }
+        $job = Start-Job -ScriptBlock $runOne -ArgumentList $summaryExe, $summaryArgs, (Join-Path $runDir 'summary.md'), (Join-Path $runDir 'summary.log'), $repoRoot, $null, $false
+    }
     Wait-Job $job -Timeout ($TimeoutMinutes * 60) | Out-Null
     $result = Receive-Job $job -ErrorAction SilentlyContinue | Select-Object -Last 1
     Remove-Job $job -Force
